@@ -1,14 +1,20 @@
 import type { NextFunction, Request, Response } from "express";
-import jwt from "jsonwebtoken";
+import { getAuth } from "@clerk/express";
 
-export function authMiddleware(req: Request, res: Response, next: NextFunction) {
-    const header = req.headers.authorization!;
-    try {
-        let data = jwt.verify(header, process.env.JWT_SECRET!);
-        req.userId = data.sub as string;
-        next();
-    } catch(e) {
-        console.log(e);
-        res.status(403).send("");
+export function requireOrgMiddleware(req: Request, res: Response, next: NextFunction) {
+    const auth = getAuth(req);
+
+    if (!auth.isAuthenticated) {
+        res.status(401).json({ error: "UNAUTHENTICATED" });
+        return;
     }
+
+    if (!auth.orgId) {
+        res.status(403).json({ error: "NO_ORGANIZATION" });
+        return;
+    }
+
+    req.userId = auth.userId;
+    req.orgId = auth.orgId;
+    next();
 }

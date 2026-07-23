@@ -1,66 +1,88 @@
 import axios from "axios";
-import { ensureConsumerGroup, xAckBulk, xReadGroup } from "redisstream/client";
+import { Worker, type Job } from "bullmq";
+import {
+    connection,
+    MONITOR_QUEUE_NAME,
+    ALERT_QUEUE_NAME,
+    alertQueue,
+    type MonitorJobData,
+    type AlertJobData
+} from "queue/client";
 import { prismaClient } from "store/client";
+import { processAlertJob } from "./alerts";
 
 const REGION_ID = process.env.REGION_ID!;
-const WORKER_ID = process.env.WORKER_ID!;
 
 if (!REGION_ID) {
     throw new Error("Region not provided");
 }
 
-if (!WORKER_ID) {
-    throw new Error("Region not provided");
-}
+async function runCheck(job: Job<MonitorJobData>) {
+    const monitor = await prismaClient.monitor.findUnique({ where: { id: job.data.monitorId } });
+    if (!monitor) {
+        return;
+    }
 
-async function main() {
-    await ensureConsumerGroup(REGION_ID);
+    const previousStatus = monitor.last_status;
+    const startTime = Date.now();
+    let status: "Up" | "Down" | "Unknown" = "Unknown";
 
-    while(1) {
-        const response = await xReadGroup(REGION_ID, WORKER_ID);
-
-        if (!response) {
-            continue;
+    if (monitor.type === "HTTP") {
+        try {
+            const response = await axios.get(monitor.url, {
+                timeout: 10_000,
+                validateStatus: () => true
+            });
+            status = response.status >= 200 && response.status < 400 ? "Up" : "Down";
+        } catch {
+            status = "Down";
         }
+    }
 
-        let promises = response.map(({message}) => fetchWebsite(message.url, message.id))
-        await Promise.all(promises);
-        console.log(promises.length);
+    const responseTimeMs = Date.now() - startTime;
+    const checkedAt = new Date();
 
-        xAckBulk(REGION_ID, response.map(({id}) => id));
+    await prismaClient.$transaction([
+        prismaClient.monitor_check.create({
+            data: {
+                response_time_ms: responseTimeMs,
+                status,
+                region_id: REGION_ID,
+                monitor_id: monitor.id,
+                createdAt: checkedAt
+            }
+        }),
+        prismaClient.monitor.update({
+            where: { id: monitor.id },
+            data: { last_status: status, last_status_at: checkedAt }
+        })
+    ]);
+
+    const isNewFailure = status === "Down" && previousStatus !== "Down";
+    const isRecovery = status === "Up" && previousStatus === "Down";
+
+    if (isNewFailure || isRecovery) {
+        await alertQueue.add(
+            "send-alert",
+            {
+                monitorId: monitor.id,
+                previousStatus,
+                newStatus: status,
+                checkedAt: checkedAt.toISOString()
+            } satisfies AlertJobData,
+            { attempts: 3, backoff: { type: "exponential", delay: 5000 } }
+        );
     }
 }
 
-async function fetchWebsite(url: string, websiteId: string) {
-    return new Promise<void>((resolve, reject) => {
-        const startTime = Date.now();
+new Worker<MonitorJobData>(MONITOR_QUEUE_NAME, runCheck, { connection, concurrency: 10 });
 
-        axios.get(url)
-            .then(async () => { 
-                const endTime = Date.now();
-                await prismaClient.website_tick.create({
-                    data: {
-                        response_time_ms: endTime - startTime,
-                        status: "Up",
-                        region_id: REGION_ID,
-                        website_id: websiteId
-                    }
-                })
-                resolve()
-            })
-            .catch(async () => {
-                const endTime = Date.now();
-                await prismaClient.website_tick.create({
-                    data: {
-                        response_time_ms: endTime - startTime,
-                        status: "Down",
-                        region_id: REGION_ID,
-                        website_id: websiteId
-                    }
-                })
-                resolve()
-            })
-    })
-}
+new Worker<AlertJobData>(
+    ALERT_QUEUE_NAME,
+    async (job) => {
+        await processAlertJob(job.data);
+    },
+    { connection }
+);
 
-main();
+console.log(`worker started for region ${REGION_ID}`);
