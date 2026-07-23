@@ -1,5 +1,5 @@
 import axios from "axios";
-import { xAckBulk, xReadGroup } from "redisstream/client";
+import { ensureConsumerGroup, xAckBulk, xReadGroup } from "redisstream/client";
 import { prismaClient } from "store/client";
 
 const REGION_ID = process.env.REGION_ID!;
@@ -14,6 +14,8 @@ if (!WORKER_ID) {
 }
 
 async function main() {
+    await ensureConsumerGroup(REGION_ID);
+
     while(1) {
         const response = await xReadGroup(REGION_ID, WORKER_ID);
 

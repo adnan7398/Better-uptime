@@ -8,6 +8,9 @@
   "exports": {
     "./client": "./index.ts"
   },
+  "prisma": {
+    "seed": "bun prisma/seed.ts"
+  },
   "peerDependencies": {
     "typescript": "^5.0.0"
   },

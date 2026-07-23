@@ -1,6 +1,6 @@
 import { createClient } from "redis";
 
-const client = await createClient()
+const client = await createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" })
   .on("error", (err) => console.log("Redis Client Error", err))
   .connect();
 
@@ -16,26 +16,30 @@ type MessageType = {
 
 const STREAM_NAME = "betteruptime:website";
 
-async function xAdd({url, id}: WebsiteEvent) {
-    await client.xAdd(
-        STREAM_NAME, '*', {
-            url,
-            id
-        }
-    );
+export async function xAddBulk(websites: WebsiteEvent[]) {
+    if (websites.length === 0) {
+        return;
+    }
+
+    const pipeline = client.multi();
+    for (const { url, id } of websites) {
+        pipeline.xAdd(STREAM_NAME, '*', { url, id });
+    }
+    await pipeline.exec();
 }
 
-export async function xAddBulk(websites: WebsiteEvent[]) {
-    for (let i = 0; i < websites.length; i++) {
-        await xAdd({
-            url: websites[i].url,
-            id: websites[i].id
-        })
+export async function ensureConsumerGroup(consumerGroup: string) {
+    try {
+        await client.xGroupCreate(STREAM_NAME, consumerGroup, '$', { MKSTREAM: true });
+    } catch (e: any) {
+        if (!e?.message?.includes("BUSYGROUP")) {
+            throw e;
+        }
     }
 }
 
 export async function xReadGroup(consumerGroup: string, workerId: string): Promise<MessageType[] | undefined> {
-    
+
     const res = await client.xReadGroup(
         consumerGroup, workerId, {
             key: STREAM_NAME,
@@ -51,10 +55,14 @@ export async function xReadGroup(consumerGroup: string, workerId: string): Promi
     return messages;
 }
 
-async function xAck(consumerGroup: string, eventId: string) {
-    await client.xAck(STREAM_NAME, consumerGroup, eventId)
-}
-
 export async function xAckBulk(consumerGroup: string, eventIds: string[]) {
-    eventIds.map(eventId => xAck(consumerGroup, eventId));
+    if (eventIds.length === 0) {
+        return;
+    }
+
+    const pipeline = client.multi();
+    for (const eventId of eventIds) {
+        pipeline.xAck(STREAM_NAME, consumerGroup, eventId);
+    }
+    await pipeline.exec();
 }
